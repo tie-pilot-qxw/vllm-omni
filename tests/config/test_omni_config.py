@@ -751,3 +751,53 @@ def test_diffusion_config_field_classification_covers_current_fields():
         "distributed_executor_backend",
     } <= omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
     assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
+
+
+def test_stage_cli_overrides_forwards_runtime_v2_flags_to_diffusion_stage():
+    """VllmOmniConfig.from_registry(cli_overrides={'enable_runtime_v2': True})
+    must select runtime_v2: build_stage_runtime_overrides blacklists the
+    OrchestratorArgs runtime_v2 flags, so _stage_cli_overrides must re-inject them
+    into the DIFFUSION stage (gated), mirroring StageConfigFactory."""
+    from types import SimpleNamespace
+
+    from vllm_omni.config.omni_config import _stage_cli_overrides
+    from vllm_omni.config.stage_config import StageExecutionType
+
+    cli = {
+        "enable_runtime_v2": True,
+        "runtime_v2_denoise_chunk_size": 4,
+        "runtime_v2_scheduler_policy": "fcfs",
+    }
+
+    diffusion_topo = SimpleNamespace(stage_id=1, execution_type=StageExecutionType.DIFFUSION)
+    diff = _stage_cli_overrides(diffusion_topo, cli)
+    assert diff.get("enable_runtime_v2") is True
+    assert diff.get("runtime_v2_denoise_chunk_size") == 4
+    assert diff.get("runtime_v2_scheduler_policy") == "fcfs"
+
+    # LLM/AR stages must NOT receive the runtime_v2 flags.
+    llm_topo = SimpleNamespace(stage_id=0, execution_type=StageExecutionType.LLM_AR)
+    llm = _stage_cli_overrides(llm_topo, cli)
+    assert "enable_runtime_v2" not in llm
+
+
+def test_diffusion_projection_carries_stage_init_timeout_to_omni_config():
+    """stage_init_timeout is an OmniDiffusionConfig field, so the structured
+    projection must carry a forwarded / YAML-set value through to the runtime
+    OmniDiffusionConfig (via _DiffusionConfigProjection.enrich_config) instead of
+    dropping it and pinning the nested runtime_v2 worker pool to 300s."""
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    # It is a real projection field (so it survives the from_engine filter) and a
+    # real OmniDiffusionConfig field (so enrich_config forwards it).
+    proj_fields = {f.name for f in fields(omni_config_module._DiffusionConfigProjection)}
+    assert "stage_init_timeout" in proj_fields
+    assert "stage_init_timeout" in omni_config_module._DIFFUSION_STAGE_ENGINE_FIELDS
+    assert "stage_init_timeout" in {f.name for f in fields(OmniDiffusionConfig)}
+
+    # The projection carries an explicit value; enrich_config (line ~645) then
+    # passes every field in (_DIFFUSION_CONFIG_FIELDS ∩ OmniDiffusionConfig fields)
+    # into OmniDiffusionConfig(**kwargs), so the three membership assertions above
+    # prove it reaches the runtime config without running the heavy enrich path.
+    proj = omni_config_module._DiffusionConfigProjection.from_kwargs(stage_init_timeout=900)
+    assert proj.stage_init_timeout == 900

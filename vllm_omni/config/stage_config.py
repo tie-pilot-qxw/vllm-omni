@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -27,6 +27,56 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+
+# runtime_v2 opt-in is a top-level-only flag: it must be set via the engine
+# entrypoint (e.g. ``Omni(..., enable_runtime_v2=True)``) so it is forwarded
+# into the diffusion stage's engine_args. A per-stage ``stage_<id>_*`` override
+# for these would be silently dropped by the OrchestratorArgs blacklist below
+# (leaving the stage on the legacy path), so we reject it loudly instead. The
+# global (unprefixed) forms are dropped too -- ``build_stage_runtime_overrides``
+# blacklists every OrchestratorArgs field -- so ``forward_runtime_v2_flags_to_
+# diffusion_stage`` re-injects them into the diffusion stage on the configured
+# path (the no-config path forwards them via _create_default_diffusion_stage_cfg).
+_RUNTIME_V2_TOPLEVEL_FLAGS = frozenset(
+    {
+        "enable_runtime_v2",
+        "runtime_v2_denoise_chunk_size",
+        "runtime_v2_scheduler_policy",
+    }
+)
+
+# Top-level params the diffusion stage needs but ``build_stage_runtime_overrides``
+# drops (every OrchestratorArgs field is blacklisted): the runtime_v2 opt-in AND
+# ``stage_init_timeout`` (the nested runtime_v2 worker pool's startup window, read
+# from od_config on the runtime_v2 path). Only the diffusion stage consumes these,
+# so they are forwarded there and nowhere else. (``stage_init_timeout`` is NOT in
+# the per-stage-override rejection set above: a global value is legitimate.)
+_DIFFUSION_STAGE_TOPLEVEL_FORWARD = _RUNTIME_V2_TOPLEVEL_FLAGS | frozenset({"stage_init_timeout"})
+
+
+def forward_runtime_v2_flags_to_diffusion_stage(
+    stage_type: Any,
+    cli_overrides: Mapping[str, Any],
+    runtime_overrides: dict[str, Any],
+) -> None:
+    """Forward top-level runtime_v2 opt-in + stage_init_timeout into a DIFFUSION stage.
+
+    ``build_stage_runtime_overrides`` drops every OrchestratorArgs field
+    (``internal_keys`` = all orchestrator fields), so the global
+    ``enable_runtime_v2`` / ``runtime_v2_*`` / ``stage_init_timeout`` knobs never
+    reach a configured stage's ``runtime_overrides`` -> ``engine_args`` ->
+    ``OmniDiffusionConfig``, silently leaving ``Omni(enable_runtime_v2=True)`` on
+    the legacy engine and the nested worker pool on the default 300s startup
+    timeout. Mirror the no-config ``_create_default_diffusion_stage_cfg``
+    forwarding here, gated to the diffusion stage so LLM/AR stages never receive a
+    flag they don't understand. Mutates ``runtime_overrides`` in place.
+    """
+    if StageType(stage_type) != StageType.DIFFUSION:
+        return
+    for key in _DIFFUSION_STAGE_TOPLEVEL_FORWARD:
+        value = cli_overrides.get(key)
+        if value is not None:
+            runtime_overrides[key] = value
 
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
@@ -75,6 +125,12 @@ def build_stage_runtime_overrides(
         if match is not None:
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
+            if param_name in _RUNTIME_V2_TOPLEVEL_FLAGS:
+                raise ValueError(
+                    f"Per-stage override {key!r} is not supported: runtime_v2 opt-in "
+                    f"must be set at the top level (e.g. Omni(..., enable_runtime_v2=True)), "
+                    f"not per stage."
+                )
             if override_stage_id == stage_id and param_name not in internal_keys:
                 result[param_name] = value
             continue

@@ -221,6 +221,11 @@ class AsyncOmniEngine:
         self.model = model
         self.tokenizer = tokenizer
         self.diffusion_batch_size = diffusion_batch_size
+        # Retained so the default diffusion stage's engine_args can forward it
+        # into od_config; the nested runtime_v2 scheduler proc reads it to honor
+        # --stage-init-timeout instead of a hardcoded 300s (it is a named __init__
+        # param, so it is NOT present in **kwargs).
+        self.stage_init_timeout = int(stage_init_timeout)
         # Cached by get_diffusion_od_config().
         self._diffusion_od_config_view: Any = None
         startup_timeout = int(init_timeout)
@@ -1003,6 +1008,20 @@ class AsyncOmniEngine:
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
+            # runtime_v2 opt-in flags are OrchestratorArgs fields (not in
+            # SHARED_FIELDS), so they are blacklisted from per-stage runtime
+            # overrides. Forward them explicitly into the default diffusion
+            # stage's engine_args here — this is the documented top-level
+            # ``Omni(enable_runtime_v2=...)`` opt-in path. They flow through
+            # _DiffusionEngineOverrides -> OmniDiffusionConfig and are read by
+            # DiffusionEngine.__init__ to select the RuntimeV2Runner path.
+            "enable_runtime_v2": kwargs.get("enable_runtime_v2", False),
+            "runtime_v2_denoise_chunk_size": kwargs.get("runtime_v2_denoise_chunk_size", 1),
+            "runtime_v2_scheduler_policy": kwargs.get("runtime_v2_scheduler_policy", "fcfs"),
+            # Forwarded so the nested runtime_v2 scheduler proc honors the outer
+            # --stage-init-timeout (injected into this builder's kwargs by the
+            # _create_default_diffusion_stage_cfg call site above).
+            "stage_init_timeout": kwargs.get("stage_init_timeout", 300),
             "request_batch_max_wait_ms": kwargs.get("request_batch_max_wait_ms", 0.0),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
@@ -1141,11 +1160,30 @@ class AsyncOmniEngine:
             else:
                 stage_overrides = stage_overrides_json
 
+        # stage_init_timeout is a named __init__ param (absent from **kwargs), so
+        # it is not in base_kwargs. Forward it into the diffusion stage so the
+        # nested runtime_v2 worker pool honors --stage-init-timeout -- but ONLY a
+        # NON-DEFAULT value. It lands in the stage's runtime_overrides, which WIN
+        # over engine_args in to_omegaconf(), so injecting the constructor default
+        # (300) would silently clobber a deploy-YAML engine_args.stage_init_timeout
+        # (e.g. 900s for a slow runtime_v2 load) back down to 300. A non-default
+        # value came from the caller and should win; leaving the default out lets
+        # the YAML (or OmniDiffusionConfig's own 300) apply. getattr-guarded so a
+        # partially-constructed engine (object.__new__ in tests) still resolves.
+        stage_init_timeout = getattr(self, "stage_init_timeout", 300)
+        configured_kwargs = dict(base_kwargs)
+        if stage_init_timeout != 300:
+            configured_kwargs["stage_init_timeout"] = stage_init_timeout
+
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
-            base_kwargs,
-            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+            configured_kwargs,
+            # The no-config factory has no YAML to clobber, so it always injects
+            # (OmniDiffusionConfig's default is 300 anyway). New dict -> kwargs unmutated.
+            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(
+                {**kwargs, "stage_init_timeout": stage_init_timeout}
+            ),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
         )

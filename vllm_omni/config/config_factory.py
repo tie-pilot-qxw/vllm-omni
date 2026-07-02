@@ -22,6 +22,7 @@ from vllm_omni.config.stage_config import (
     StageConfig,
     StageType,
     build_stage_runtime_overrides,
+    forward_runtime_v2_flags_to_diffusion_stage,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -224,6 +225,14 @@ class StageConfigFactory:
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
+            # build_stage_runtime_overrides blacklists every OrchestratorArgs
+            # field, dropping the top-level runtime_v2 opt-in; re-inject it into
+            # the diffusion stage so Omni(enable_runtime_v2=True) selects
+            # runtime_v2 on the registry/deploy path too (the no-config path
+            # forwards it via _create_default_diffusion_stage_cfg).
+            forward_runtime_v2_flags_to_diffusion_stage(
+                stage.stage_type, explicit_overrides, stage.runtime_overrides
+            )
 
         return stages
 

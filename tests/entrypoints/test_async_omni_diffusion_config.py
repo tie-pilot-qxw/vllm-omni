@@ -33,6 +33,31 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_forwards_stage_init_timeout():
+    """The default diffusion-stage builder must forward stage_init_timeout into
+    engine_args -> OmniDiffusionConfig, so the nested runtime_v2 scheduler proc
+    honors --stage-init-timeout instead of a hardcoded 300s. The value is
+    injected into the builder's kwargs at the call site (from self.stage_init_timeout)."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "model_class_name": "QwenImagePipeline",
+            "stage_init_timeout": 777,
+        }
+    )[0]
+
+    assert stage_cfg["engine_args"]["stage_init_timeout"] == 777
+
+
+def test_default_stage_config_stage_init_timeout_defaults_300():
+    """When the caller does not inject it, the builder defaults to 300 (matching
+    the OmniDiffusionConfig default), not a missing key."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {"model_class_name": "QwenImagePipeline"}
+    )[0]
+
+    assert stage_cfg["engine_args"]["stage_init_timeout"] == 300
+
+
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
@@ -359,3 +384,32 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
 
     assert not hasattr(stage_configs[0].engine_args, "additional_config")
     assert stage_configs[1].engine_args.additional_config == {"torchair_graph_config": {"enabled": True}}
+
+
+def test_resolve_stage_configs_omits_default_stage_init_timeout(mocker):
+    """The constructor-default stage_init_timeout (300) must NOT be injected as a
+    cli-override: it lands in the diffusion stage's runtime_overrides (which win
+    over engine_args in to_omegaconf) and would clobber a deploy-YAML
+    engine_args.stage_init_timeout (e.g. 900s). A NON-default value IS forwarded
+    so the caller's --stage-init-timeout still wins."""
+    captured = {}
+
+    def _fake(model, stage_configs_path, kwargs, **kw):
+        captured["kwargs"] = kwargs
+        return ("dummy.yaml", [])
+
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=_fake,
+    )
+
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine.stage_init_timeout = 300  # default -> must be omitted (let YAML win)
+    engine._resolve_stage_configs("dummy-model", {"stage_configs_path": "dummy.yaml"})
+    assert "stage_init_timeout" not in captured["kwargs"]
+
+    engine.stage_init_timeout = 900  # non-default caller override -> forwarded
+    engine._resolve_stage_configs("dummy-model", {"stage_configs_path": "dummy.yaml"})
+    assert captured["kwargs"]["stage_init_timeout"] == 900

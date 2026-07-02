@@ -90,22 +90,28 @@ class StageDiffusionProc:
         return 0 if tasks is None else len(tasks)
 
     def _is_executor_dead(self) -> bool:
-        """True iff the multiproc executor has been closed or marked failed.
+        """True iff the engine's execution backend has permanently failed.
 
-        Detects the "workers died but the diffusion proc is still pulling
-        requests" case: ``MultiprocDiffusionExecutor`` sets ``_closed = True``
-        and ``is_failed = True`` from its worker-monitor thread the moment any
-        worker process exits; every subsequent ``execute_request`` /
-        ``collective_rpc`` then raises ``RuntimeError("DiffusionExecutor is
-        closed.")`` inside the engine. Callers in ``run_loop`` use this to
-        decide whether a per-request failure is recoverable or fatal.
+        Delegates to :meth:`DiffusionEngine.is_backend_dead`, which is
+        path-agnostic:
+
+        * legacy: ``MultiprocDiffusionExecutor`` sets ``_closed = True`` /
+          ``is_failed = True`` from its worker-monitor thread the moment any
+          worker exits; every subsequent ``execute_request`` / ``collective_rpc``
+          then raises ``RuntimeError("DiffusionExecutor is closed.")``.
+        * runtime_v2: the executor is ``None`` and the scheduler + workers live
+          in a SEPARATE process; the engine reports dead when its scheduler
+          client saw the death sentinel or the scheduler proc is no longer alive.
+
+        Without the runtime_v2 branch this returned ``False`` forever under the
+        flag (``engine.executor is None``), so ``run_loop`` never signaled a
+        fatal failure and the stage proc kept serving 500s while heartbeats
+        reported UP. Callers in ``run_loop`` use this to decide whether a
+        per-request failure is recoverable or fatal.
         """
         if self._engine is None:
             return False
-        executor = getattr(self._engine, "executor", None)
-        if executor is None:
-            return False
-        return bool(getattr(executor, "_closed", False) or getattr(executor, "is_failed", False))
+        return bool(self._engine.is_backend_dead())
 
     def _signal_fatal_engine_failure(self, reason: str) -> None:
         """Idempotently signal ``run_loop`` to tear down on a fatal engine error."""
@@ -325,6 +331,26 @@ class StageDiffusionProc:
         # "DiffusionExecutor is closed" on every subsequent request.
         fatal_event = asyncio.Event()
         self._fatal_event = fatal_event
+
+        # Wake THIS idle loop if the execution backend (e.g. the nested runtime_v2
+        # scheduler proc) dies while we are blocked on recv -- otherwise the
+        # coordinator heartbeat only reports queue_length and the replica stays
+        # advertised healthy until a request happens to touch the dead client. The
+        # backend's death monitor runs off-loop, so hop onto this loop thread
+        # before setting the asyncio fatal_event. Registered after fatal_event
+        # exists; fires immediately if the backend already died (race).
+        loop = asyncio.get_running_loop()
+        # Optional hook -- only the runtime_v2 DiffusionEngine implements it. Legacy
+        # / custom / test engine stand-ins that only provide the request APIs do
+        # not, so an unconditional call would AttributeError before the stage
+        # serves anything. Skip it when absent.
+        register_backend_dead_callback = getattr(self._engine, "register_backend_dead_callback", None)
+        if callable(register_backend_dead_callback):
+            register_backend_dead_callback(
+                lambda: loop.call_soon_threadsafe(
+                    self._signal_fatal_engine_failure, "backend process died while idle"
+                )
+            )
 
         async def _dispatch_request(
             request_id: str,

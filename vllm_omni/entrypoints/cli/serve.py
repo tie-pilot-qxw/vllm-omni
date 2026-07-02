@@ -556,6 +556,30 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
         )
+        # runtime_v2 opt-in flags. These mirror the OrchestratorArgs fields of the
+        # same name; the vllm serve parser registers diffusion flags manually, so
+        # without these three `vllm serve ... --enable-runtime-v2` is rejected by
+        # argparse before the value can reach the engine. TrackingNamespace forwards
+        # any explicitly-set flag via get_explicit_kwargs_dict(), and
+        # async_omni_engine already forwards these keys into the diffusion stage.
+        omni_config_group.add_argument(
+            "--enable-runtime-v2",
+            action="store_true",
+            help="Enable the runtime_v2 task-centric diffusion scheduler (PR1: single-group "
+            "FCFS Qwen-Image), which runs the global scheduler in a separate process.",
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-denoise-chunk-size",
+            type=int,
+            default=1,
+            help="runtime_v2: number of denoise steps dispatched per DIT_STEP_CHUNK task (default: 1).",
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-scheduler-policy",
+            type=str,
+            default="fcfs",
+            help="runtime_v2: global scheduler policy (default: 'fcfs').",
+        )
         omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
             type=float,

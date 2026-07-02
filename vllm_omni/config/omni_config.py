@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     _scheduler_path,
     _select_processor_funcs,
     build_stage_runtime_overrides,
+    forward_runtime_v2_flags_to_diffusion_stage,
     load_deploy_config,
 )
 
@@ -205,13 +206,21 @@ def _resolve_scheduler_path(execution_type: StageExecutionType, async_scheduling
     return _scheduler_path(_resolve_scheduler(execution_type, async_scheduling))
 
 
-def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
+def _stage_cli_overrides(topology: StagePipelineConfig, cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
+    stage_id = topology.stage_id
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
         if key in global_stage_fields or f"stage_{stage_id}_{key}" in cli_overrides:
             result[key] = _copy_value(value)
+    # The top-level runtime_v2 opt-in flags are OrchestratorArgs fields that
+    # build_stage_runtime_overrides blacklists, so they were just dropped. Mirror
+    # StageConfigFactory: re-inject them into the DIFFUSION stage (gated) so that
+    # from_registry(cli_overrides={'enable_runtime_v2': True}) actually selects
+    # runtime_v2 instead of silently building a legacy diffusion config.
+    stage_type, _ = _resolve_execution_mode(topology.execution_type)
+    forward_runtime_v2_flags_to_diffusion_stage(stage_type, cli_overrides, result)
     return result
 
 
@@ -472,6 +481,15 @@ class _DiffusionConfigProjection:
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
+    enable_runtime_v2: bool = False
+    runtime_v2_denoise_chunk_size: int = 1
+    runtime_v2_scheduler_policy: str = "fcfs"
+    # Startup window the nested runtime_v2 worker pool honors. Mirrors the
+    # OmniDiffusionConfig field so the structured (from_registry) path projects a
+    # forwarded / YAML-set stage_init_timeout instead of dropping it (which would
+    # pin the nested pool to 300s). Lands in _DIFFUSION_ONLY_CONFIG_FIELDS (the
+    # remainder set) automatically, so the field-classification invariant holds.
+    stage_init_timeout: int = 300
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     model_paths: dict[str, str] = field(default_factory=dict)
@@ -1274,7 +1292,7 @@ class VllmOmniConfig:
                 deploy_by_id.get(topology.stage_id),
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
-                    _stage_cli_overrides(topology.stage_id, cli_overrides),
+                    _stage_cli_overrides(topology, cli_overrides),
                 ),
                 model=model,
             )

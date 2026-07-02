@@ -29,6 +29,7 @@ from vllm_omni.config.stage_config import (
     _deep_merge_stage,
     _resolve_scheduler,
     build_stage_runtime_overrides,
+    forward_runtime_v2_flags_to_diffusion_stage,
     load_deploy_config,
     merge_pipeline_deploy,
     pipeline_cfg_resolver,
@@ -134,6 +135,102 @@ class TestStageConfig:
         assert omega_config.runtime.devices == "0,1"
         # max_batch_size is migrated to engine_args.max_num_seqs
         assert omega_config.engine_args.max_num_seqs == 64
+
+    def test_runtime_v2_flags_dropped_by_build_stage_runtime_overrides(self):
+        """Root cause: the top-level runtime_v2 opt-in is an OrchestratorArgs
+        field, so build_stage_runtime_overrides blacklists it -- it never reaches
+        a configured stage's overrides on its own."""
+        out = build_stage_runtime_overrides(
+            1,
+            {"enable_runtime_v2": True, "runtime_v2_denoise_chunk_size": 4},
+        )
+        assert "enable_runtime_v2" not in out
+        assert "runtime_v2_denoise_chunk_size" not in out
+
+    def test_forward_runtime_v2_flags_injects_for_diffusion_stage(self):
+        """The forward helper re-injects the top-level runtime_v2 opt-in into a
+        DIFFUSION stage's overrides (what the registry/deploy path relies on)."""
+        overrides: dict = {}
+        forward_runtime_v2_flags_to_diffusion_stage(
+            StageType.DIFFUSION,
+            {
+                "enable_runtime_v2": True,
+                "runtime_v2_denoise_chunk_size": 4,
+                "runtime_v2_scheduler_policy": "fcfs",
+                "unrelated": "x",
+            },
+            overrides,
+        )
+        assert overrides == {
+            "enable_runtime_v2": True,
+            "runtime_v2_denoise_chunk_size": 4,
+            "runtime_v2_scheduler_policy": "fcfs",
+        }
+
+    def test_forward_runtime_v2_flags_skips_non_diffusion_stage(self):
+        """LLM/AR stages must NOT receive the runtime_v2 flags."""
+        overrides: dict = {}
+        forward_runtime_v2_flags_to_diffusion_stage(
+            StageType.LLM, {"enable_runtime_v2": True}, overrides
+        )
+        assert overrides == {}
+
+    def test_forward_runtime_v2_flags_absent_are_not_injected(self):
+        """When the caller did not opt in, nothing is added (no spurious False)."""
+        overrides: dict = {}
+        forward_runtime_v2_flags_to_diffusion_stage(StageType.DIFFUSION, {}, overrides)
+        assert overrides == {}
+
+    def test_forward_stage_init_timeout_for_diffusion_stage(self):
+        """stage_init_timeout is an OrchestratorArgs field too, so the same
+        forward must carry it into the diffusion stage (the nested runtime_v2
+        worker pool reads it); otherwise a configured stage keeps the 300s
+        default despite Omni(..., stage_init_timeout=900)."""
+        overrides: dict = {}
+        forward_runtime_v2_flags_to_diffusion_stage(
+            StageType.DIFFUSION, {"stage_init_timeout": 900}, overrides
+        )
+        assert overrides == {"stage_init_timeout": 900}
+
+    def test_forward_stage_init_timeout_skipped_for_llm_stage(self):
+        overrides: dict = {}
+        forward_runtime_v2_flags_to_diffusion_stage(
+            StageType.LLM, {"stage_init_timeout": 900}, overrides
+        )
+        assert overrides == {}
+
+    def test_forwarded_stage_init_timeout_reaches_engine_args_via_to_omegaconf(self):
+        overrides: dict = {}
+        forward_runtime_v2_flags_to_diffusion_stage(
+            StageType.DIFFUSION, {"stage_init_timeout": 900}, overrides
+        )
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            runtime_overrides=overrides,
+        )
+        omega_config = config.to_omegaconf()
+        assert omega_config.engine_args.stage_init_timeout == 900
+
+    def test_forwarded_runtime_v2_flags_reach_engine_args_via_to_omegaconf(self):
+        """End-to-end: once forwarded into a diffusion stage's runtime_overrides,
+        the flags flow into engine_args (which becomes OmniDiffusionConfig)."""
+        overrides: dict = {}
+        forward_runtime_v2_flags_to_diffusion_stage(
+            StageType.DIFFUSION,
+            {"enable_runtime_v2": True, "runtime_v2_denoise_chunk_size": 4},
+            overrides,
+        )
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            runtime_overrides=overrides,
+        )
+        omega_config = config.to_omegaconf()
+        assert omega_config.engine_args.enable_runtime_v2 is True
+        assert omega_config.engine_args.runtime_v2_denoise_chunk_size == 4
 
     def test_to_omegaconf_max_batch_size_deprecation(self):
         """Test that runtime.max_batch_size emits a FutureWarning."""

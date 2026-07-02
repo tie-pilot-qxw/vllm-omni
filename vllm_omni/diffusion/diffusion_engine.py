@@ -9,7 +9,7 @@ import inspect
 import queue
 import threading
 import time
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +55,13 @@ if TYPE_CHECKING:
     from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+# How long the drain loop keeps a tombstone for an aborted runtime_v2 request so
+# it can pull + discard a terminal the scheduler proc had already sent before the
+# abort (freeing that result's packed SHM handles). The late terminal, if any,
+# is already on the wire when the abort is processed, so this only needs to cover
+# ZMQ transit + drain latency; a generous window costs one id + float per abort.
+_RUNTIME_V2_ABORT_TOMBSTONE_S = 10.0
 
 __all__ = [
     "DiffusionEngine",
@@ -165,13 +172,85 @@ class DiffusionEngine:
             self.od_config.step_execution = True
             self.step_execution = True
 
-        executor_class = DiffusionExecutor.get_class(od_config)
-        self.executor = executor_class(od_config)
-        self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
-        )
-        self.scheduler.initialize(od_config)
-        self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
+        # runtime_v2: when enabled, the legacy executor/scheduler/execute_fn are
+        # NOT built; the RuntimeV2Runner owns scheduling + execution. The legacy
+        # attributes are set to None so any unguarded reference fails loudly
+        # instead of silently using the wrong path.
+        self.enable_runtime_v2 = bool(getattr(od_config, "enable_runtime_v2", False))
+        # runtime_v2 proc/client handles (populated in
+        # _check_and_start_background_loop, once we have a running event loop for
+        # the drain task). The scheduler now lives in its OWN process
+        # (RuntimeV2SchedulerProc), spawned by the manager below; this engine
+        # only holds a ZMQ client to it -- there is no in-process RuntimeV2Runner
+        # or busy-loop worker thread any more.
+        self._rv2_proc_manager = None
+        self._rv2_client = None
+        self._rv2_drain_task: asyncio.Task | None = None
+        if self.enable_runtime_v2:
+            # Unambiguous, engine-level signal that the runtime_v2 path was
+            # actually selected (vs. the legacy scheduler/executor path). The
+            # GPU smoke greps for this to PROVE runtime_v2 ran end-to-end, since
+            # the diffusion stage runs in a subprocess and the engine object is
+            # not reachable from the parent Omni handle.
+            logger.info(
+                "runtime_v2 active: enable_runtime_v2=%s denoise_chunk_size=%s scheduler_policy=%s",
+                self.enable_runtime_v2,
+                int(getattr(od_config, "runtime_v2_denoise_chunk_size", 1) or 1),
+                str(getattr(od_config, "runtime_v2_scheduler_policy", "fcfs")),
+            )
+            # Spawn the scheduler subprocess (which builds the RuntimeV2Runner =
+            # GlobalScheduler + MultiprocWorkerPool, and thus becomes the parent
+            # of the GPU workers). Distinct ZMQ addresses are freshly allocated
+            # inside the manager; the client binds them and the proc connects.
+            from vllm_omni.diffusion.runtime_v2.scheduler_client import RuntimeV2SchedulerClient
+            from vllm_omni.diffusion.runtime_v2.scheduler_proc import RuntimeV2SchedulerProcManager
+
+            self._rv2_proc_manager = RuntimeV2SchedulerProcManager(
+                model=getattr(od_config, "model", None),
+                od_config=od_config,
+                stage_init_timeout=int(getattr(od_config, "stage_init_timeout", 300)),
+            )
+            try:
+                self._rv2_client = RuntimeV2SchedulerClient.from_addresses(
+                    request_address=self._rv2_proc_manager.addresses.inputs[0],
+                    response_address=self._rv2_proc_manager.addresses.outputs[0],
+                    proc_manager=self._rv2_proc_manager,
+                )
+            except BaseException:
+                # The manager already spawned the scheduler subprocess (and, under
+                # it, the GPU workers). __init__ is aborting BEFORE the engine is
+                # handed to StageDiffusionProc, so no later close() can reach
+                # _rv2_proc_manager -- shut it down here or the nested scheduler /
+                # worker processes leak after a failed startup (e.g. IPC bind or
+                # monitor-setup failure in from_addresses).
+                try:
+                    self._rv2_proc_manager.shutdown(timeout=10)
+                except Exception as shutdown_exc:
+                    logger.warning(
+                        "Error shutting down runtime_v2 scheduler proc manager after "
+                        "client setup failure: %s",
+                        shutdown_exc,
+                    )
+                self._rv2_proc_manager = None
+                raise
+            self.scheduler = None
+            self.executor = None
+            self.execute_fn = None
+            self.supports_request_batch = False
+            # The scheduler runner now lives in the scheduler proc, not in this
+            # process. Keep the legacy attribute defined (as None) so callers
+            # that probe ``engine.runtime_v2_runner`` (e.g. inline client health)
+            # still work and route to the client-based health path.
+            self.runtime_v2_runner = None
+        else:
+            self.runtime_v2_runner = None
+            executor_class = DiffusionExecutor.get_class(od_config)
+            self.executor = executor_class(od_config)
+            self.scheduler: SchedulerInterface = scheduler or (
+                StepScheduler() if self.step_execution else RequestScheduler()
+            )
+            self.scheduler.initialize(od_config)
+            self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -185,16 +264,31 @@ class DiffusionEngine:
         self._cv = threading.Condition(self._rpc_lock)
         self._out_queue: dict[str, asyncio.Future] = {}
         self._out_queue_streaming: dict[str, asyncio.Queue[DiffusionOutput]] = {}
+        # runtime_v2: request ids sent to the scheduler proc whose futures are
+        # awaiting a terminal result drained from the scheduler client.
+        self._runtime_v2_inflight: set[str] = set()
+        # runtime_v2: aborted request ids whose futures are already resolved but
+        # whose scheduler-proc terminal MAY still be arriving/buffered in the
+        # client with packed SHM handles. Maps id -> GC deadline (monotonic s).
+        # The drain loop pulls + materializes (unlinks SHM) + discards any late
+        # terminal for these, then drops the tombstone (see _drain ... tombstones).
+        self._runtime_v2_aborted: dict[str, float] = {}
+        # runtime_v2 no longer needs an in-process submit hand-off queue: the
+        # scheduler (GlobalScheduler) lives in a SEPARATE process now, so
+        # add_request just sends over the ZMQ client on the event-loop thread and
+        # a drain task pulls results back. There is no in-process lock-free
+        # scheduler for the engine to guard.
         self._closed = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        if self.step_execution:
-            self.execute_fn = self.executor.execute_step
-        elif self.supports_request_batch:
-            self.execute_fn = self.executor.execute_batch
-        else:
-            self.execute_fn = self.executor.execute_request
+        if not self.enable_runtime_v2:
+            if self.step_execution:
+                self.execute_fn = self.executor.execute_step
+            elif self.supports_request_batch:
+                self.execute_fn = self.executor.execute_batch
+            else:
+                self.execute_fn = self.executor.execute_request
 
         if self.supports_request_batch:
             logger.info(
@@ -203,12 +297,16 @@ class DiffusionEngine:
                 getattr(od_config, "request_batch_max_wait_ms", None),
             )
 
-        try:
-            self._dummy_run()
-        except Exception as e:
-            logger.error(f"Dummy run failed: {e}")
-            self.close()
-            raise e
+        # runtime_v2 warms lazily on the first real request (PR1 skips warmup);
+        # _dummy_run drives the legacy scheduler/execute_fn, which do not exist
+        # in runtime_v2 mode.
+        if not self.enable_runtime_v2:
+            try:
+                self._dummy_run()
+            except Exception as e:
+                logger.error(f"Dummy run failed: {e}")
+                self.close()
+                raise e
 
     async def _check_and_start_background_loop(self):
         if self._closed:
@@ -225,8 +323,18 @@ class DiffusionEngine:
 
             self.main_loop = asyncio.get_running_loop()
             self.stop_event = threading.Event()
-            self.worker_thread = threading.Thread(target=self._busy_loop)
-            self.worker_thread.start()
+            # getattr guard: some unit tests build the engine via object.__new__
+            # and set only a subset of attributes; treat a missing flag as the
+            # legacy path so those partial test doubles keep working.
+            if getattr(self, "enable_runtime_v2", False):
+                # runtime_v2: the scheduler runs in its OWN process. There is no
+                # in-process busy-loop worker thread; instead an asyncio task on
+                # this loop periodically drains the scheduler client's responses
+                # and resolves the awaiting futures.
+                self._rv2_drain_task = self.main_loop.create_task(self._runtime_v2_drain_loop())
+            else:
+                self.worker_thread = threading.Thread(target=self._busy_loop)
+                self.worker_thread.start()
             self._loop_started = True
 
     async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
@@ -304,6 +412,19 @@ class DiffusionEngine:
         action_only_output = bool(custom_output.get("action_only_output"))
 
         postprocess_start_time = time.perf_counter()
+        # Bracket the (CPU-bound, tensor->PIL) postprocess with begin/end markers.
+        # In runtime_v2 the scheduler lives in a SEPARATE process, so its dispatch
+        # (worker dit chunk timing) must continue THROUGH this window; the
+        # isolation proof (tests/e2e/test_runtime_v2_scheduler_isolation.py) greps
+        # these two lines to show scheduler dispatch timestamps interleave with an
+        # earlier request's postprocess window. Cheap (two INFO lines/request) and
+        # identical on the legacy path, so it does not perturb behavior.
+        if getattr(self, "enable_runtime_v2", False):
+            logger.info(
+                "runtime_v2 postprocess begin: request_id=%s mono_ns=%s",
+                getattr(request, "request_id", None),
+                time.monotonic_ns(),
+            )
         if action_only_output:
             outputs = []
         elif self.post_process_func is not None:
@@ -315,6 +436,13 @@ class DiffusionEngine:
                 outputs = self.post_process_func(output_data)
         else:
             outputs = output_data
+        if getattr(self, "enable_runtime_v2", False):
+            logger.info(
+                "runtime_v2 postprocess end: request_id=%s mono_ns=%s elapsed_ms=%.1f",
+                getattr(request, "request_id", None),
+                time.monotonic_ns(),
+                (time.perf_counter() - postprocess_start_time) * 1000.0,
+            )
 
         postprocess_output = normalize_diffusion_postprocess_output(outputs, custom_output)
         custom_output = postprocess_output.custom_output
@@ -367,6 +495,10 @@ class DiffusionEngine:
         )
 
     def _busy_loop(self):
+        # runtime_v2 does NOT run this thread: its scheduler lives in a separate
+        # process and results are drained by an asyncio task
+        # (_runtime_v2_drain_loop), so _check_and_start_background_loop never
+        # starts this worker thread under the flag.
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
@@ -431,6 +563,202 @@ class DiffusionEngine:
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    async def _runtime_v2_drain_loop(self) -> None:
+        """Asyncio task (on ``main_loop``) draining the scheduler-proc client.
+
+        Replaces the old in-process ``_runtime_v2_busy_loop`` worker thread. The
+        scheduler (``GlobalScheduler`` + workers) now lives in a SEPARATE process
+        (``RuntimeV2SchedulerProc``); this task only touches the ZMQ client on
+        the event-loop thread -- there is no in-process scheduler to own, submit
+        to, or lock. Each tick it drains the client's responses and, for every
+        in-flight request whose terminal ``DiffusionOutput`` has arrived:
+
+          * a normal result -> ``_materialize_runtime_v2_output`` UNPACKS the SHM
+            handle HERE (in StageDiffusionProc, the only process that should
+            touch the big tensor) then resolves the future -- the same
+            ``DiffusionOutput`` type the legacy path returns, so downstream
+            ``postprocess_output`` / ``format_diffusion_outputs`` is identical;
+          * a scheduler-side error -> resolves with ``DiffusionOutput(error=...)``;
+          * proc death (client ``_engine_dead``) -> fails ALL in-flight requests.
+        """
+        client = self._rv2_client
+        assert client is not None
+        while not self.stop_event.is_set():
+            # Snapshot the in-flight request ids registered by add_request, plus
+            # the aborted-id tombstones whose late terminals must be drained +
+            # discarded so their SHM handles don't leak.
+            with self._cv:
+                inflight = list(self._runtime_v2_inflight)
+                aborted = dict(self._runtime_v2_aborted)
+
+            if aborted:
+                self._drain_runtime_v2_aborted_tombstones(client, aborted)
+
+            if client.engine_dead:
+                # The proc may have sent a real result (buffered in the client /
+                # socket) before dying. Drain each request FIRST so a completed
+                # result is DELIVERED (and its SHM handles materialized + unlinked)
+                # instead of discarded; fail only requests with nothing buffered.
+                for rid in inflight:
+                    try:
+                        delivered = self._try_deliver_runtime_v2_result(client, rid)
+                    except EngineDeadError:
+                        delivered = False
+                    except Exception as exc:  # noqa: BLE001 - contain to this request
+                        logger.error("runtime_v2 drain failed for %s", rid, exc_info=True)
+                        self._resolve_runtime_v2_request(rid, DiffusionOutput.from_exception(exc))
+                        continue
+                    if not delivered:
+                        self._resolve_runtime_v2_request(
+                            rid, DiffusionOutput(error="RuntimeV2SchedulerProc died unexpectedly.")
+                        )
+                # Keep looping (sleeping) so newly-registered requests also fail
+                # promptly until the engine is closed.
+                await asyncio.sleep(0.05)
+                continue
+
+            if not inflight:
+                # Nothing to drain for; yield briefly so we don't spin.
+                await asyncio.sleep(0.01)
+                continue
+
+            for rid in inflight:
+                if self.stop_event.is_set():
+                    break
+                try:
+                    self._try_deliver_runtime_v2_result(client, rid)
+                except EngineDeadError:
+                    # Surfaced by the client when the proc is dead; fail this and
+                    # let the next tick fail the rest via the engine_dead branch.
+                    self._resolve_runtime_v2_request(
+                        rid, DiffusionOutput(error="RuntimeV2SchedulerProc died unexpectedly.")
+                    )
+                except Exception as exc:  # noqa: BLE001 - propagate to caller
+                    logger.error("runtime_v2 drain failed for %s", rid, exc_info=True)
+                    self._resolve_runtime_v2_request(rid, DiffusionOutput.from_exception(exc))
+
+            # Yield to the event loop; a short sleep keeps drain latency low
+            # without busy-spinning while requests are in flight.
+            await asyncio.sleep(0.005)
+
+    def _try_deliver_runtime_v2_result(self, client: Any, rid: str) -> bool:
+        """Fetch ``rid``'s terminal from the client and resolve its future if present.
+
+        Returns True if the request was resolved (a result or a scheduler-side
+        error was delivered), False if no terminal has arrived yet. For a
+        successful result this materializes (UNPACKS + UNLINKS) the SHM handles;
+        a materialize failure is contained to THIS request (resolved as an error)
+        so it can't tear down the drain loop. Propagates ``EngineDeadError`` to
+        the caller (proc dead with nothing buffered for this id). Shared by the
+        normal drain and the ``engine_dead`` branch so both drain buffered
+        results identically (a terminal the proc sent before dying is delivered,
+        not discarded, and its SHM is freed).
+        """
+        result = client.get_result_nowait(rid)
+        if result is None:
+            # Terminal not yet arrived for this request.
+            return False
+        if result.error is not None:
+            # Scheduler-side error: already a DiffusionOutput carrying the error
+            # metadata (no SHM to unpack); resolve as-is.
+            self._resolve_runtime_v2_request(rid, result)
+            return True
+        # UNPACK the SHM handle HERE, in StageDiffusionProc -- the raw
+        # DiffusionOutput arrived with handles kept packed. A bad/orphaned handle
+        # (producer died and the segment was already unlinked) must fail ONLY this
+        # request rather than escape and strand every other in-flight future.
+        try:
+            output = self._materialize_runtime_v2_output(result)
+        except Exception as exc:  # noqa: BLE001 - contain to this request
+            logger.error("runtime_v2 materialize failed for %s", rid, exc_info=True)
+            self._resolve_runtime_v2_request(rid, DiffusionOutput.from_exception(exc))
+        else:
+            self._resolve_runtime_v2_request(rid, output)
+        return True
+
+    def _drain_runtime_v2_aborted_tombstones(self, client: Any, aborted: dict[str, float]) -> None:
+        """Pull + discard any late terminal for aborted runtime_v2 ids.
+
+        An abort resolves the future and drops the id from
+        ``_runtime_v2_inflight`` immediately, so the main drain never fetches a
+        terminal the scheduler proc had already sent for it. That result would
+        sit in the client buffer (or arrive shortly after) carrying packed SHM
+        handles that never get unlinked. For each tombstoned id: fetch it; if a
+        terminal arrived, materialize it (which UNPACKS + UNLINKS the SHM
+        handles) and discard it (the caller already got an aborted output); GC
+        the tombstone once drained, its window elapses, or the proc is dead.
+        """
+        now = time.monotonic()
+        drop: list[str] = []
+        for rid, deadline in aborted.items():
+            try:
+                result = client.get_result_nowait(rid)
+            except EngineDeadError:
+                # Proc dead: get_result_nowait already popped any buffered result
+                # before raising, so nothing more can arrive for this id.
+                drop.append(rid)
+                continue
+            except Exception:  # noqa: BLE001 - best-effort discard
+                logger.warning("runtime_v2 aborted-tombstone drain failed for %s", rid, exc_info=True)
+                drop.append(rid)
+                continue
+            if result is not None:
+                # Free the SHM segments; do NOT resolve the future (already
+                # resolved as aborted). A scheduler-side error carries no SHM.
+                # A failed unlink (segment already gone) is best-effort here --
+                # never let it escape and kill the drain loop.
+                if getattr(result, "error", None) is None:
+                    try:
+                        self._materialize_runtime_v2_output(result)
+                    except Exception:  # noqa: BLE001 - best-effort unlink
+                        logger.warning(
+                            "runtime_v2 aborted-tombstone materialize failed for %s", rid, exc_info=True
+                        )
+                drop.append(rid)
+            elif now >= deadline:
+                # No late terminal within the window: the request was aborted
+                # before it finished, so no result will ever come. GC.
+                drop.append(rid)
+        if drop:
+            with self._cv:
+                for rid in drop:
+                    self._runtime_v2_aborted.pop(rid, None)
+
+    def _materialize_runtime_v2_output(self, payload: Any) -> DiffusionOutput:
+        """Wrap a runtime_v2 'finished' payload into a ``DiffusionOutput`` and
+        materialize any POSIX-SHM tensor handles.
+
+        The terminal artifact is fetched through the runtime_v2 worker pool with
+        ``unpack_shm=False`` (see ``MultiprocWorkerPool._normalize_fetch_result``),
+        so large tensor fields may still be SHM handle dicts. This is the "final
+        postprocess site": materialize the tensors and unlink the SHM segments
+        BEFORE the output reaches the future / ``format_diffusion_outputs`` —
+        otherwise the formatter sees ``{"__tensor_shm__": ...}`` dicts and the
+        segments leak. Shared by the async busy loop AND the synchronous
+        ``add_req_and_wait_for_response`` path so neither can bypass it.
+        """
+        output = payload if isinstance(payload, DiffusionOutput) else DiffusionOutput(output=payload)
+        if isinstance(output, DiffusionOutput):
+            from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
+
+            unpack_diffusion_output_shm(output)
+        return output
+
+    def _resolve_runtime_v2_request(self, request_id: str, output: DiffusionOutput) -> None:
+        """Resolve a runtime_v2 request's future and stop tracking it.
+
+        Routes the materialized ``DiffusionOutput`` through the SAME future /
+        ``_out_queue`` path the legacy ``_handle_finished_requests`` uses, so the
+        API surface (``get_result`` -> ``postprocess_output`` ->
+        ``format_diffusion_outputs``) is identical.
+        """
+        with self._cv:
+            self._runtime_v2_inflight.discard(request_id)
+            fut = self._out_queue.pop(request_id, None)
+        if fut is None:
+            return
+        self._complete_future(fut, output)
 
     def _wait_for_request_batch_admission_locked(self) -> None:
         """Wait for compatible requests to accumulate before scheduling a wave.
@@ -624,6 +952,15 @@ class DiffusionEngine:
         return DiffusionEngine(config, scheduler=scheduler)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
+        if getattr(self, "enable_runtime_v2", False):
+            # runtime_v2's add_request sends over ZMQ to the scheduler proc and
+            # is awaitable; callers must use the async entry points
+            # (async_add_req_and_wait_for_response), which await
+            # _add_request_runtime_v2 directly. Fail loudly if someone reaches
+            # the sync path under the flag.
+            raise NotImplementedError(
+                "runtime_v2 requires the async add path (async_add_req_and_wait_for_response)."
+            )
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -637,6 +974,82 @@ class DiffusionEngine:
                 self._out_queue_streaming[request_id] = queue
             self._cv.notify_all()
 
+        return request_id
+
+    async def _add_request_runtime_v2(self, request: OmniDiffusionRequest) -> str:
+        """Register a request's future and send it to the scheduler proc.
+
+        This runs on the event-loop thread. The scheduler (``GlobalScheduler``)
+        lives in a SEPARATE process now, so there is no in-process lock-free
+        scheduler to guard and no submit hand-off queue: we register the future
+        under ``request.request_id`` in ``self._out_queue``, mark the request
+        in-flight, then ``await self._rv2_client.add_request(...)`` which sends
+        the ``add_request`` message over ZMQ. The drain task
+        (``_runtime_v2_drain_loop``) resolves the future when the scheduler proc
+        returns the terminal ``DiffusionOutput``.
+
+        The request id is knowable up front (the scheduler proc keys its result
+        by the ``request_id`` we send), so we key the future / in-flight set
+        under ``request.request_id`` and return it. Reuses the SAME future /
+        ``_out_queue`` machinery the legacy path uses, so ``get_result`` is
+        unchanged.
+        """
+        if self.od_config.streaming_output:
+            raise NotImplementedError("runtime_v2 does not support streaming_output in PR1")
+        # Upstream KV transfer (multi-stage AR->diffusion) is OUT of PR1 scope:
+        # the runtime_v2 QwenPrepareExecutor copies kv_sender_info onto the state
+        # but NEVER calls kv_transfer_manager.receive_multi_kv_cache_distributed
+        # (which the legacy diffusion_model_runner does), so a request carrying
+        # kv_sender_info would silently run WITHOUT receiving the upstream KV. Fail
+        # loudly here -- the earliest FRONTEND entry point that has the request --
+        # so the error surfaces synchronously to the caller before crossing into
+        # the scheduler proc. (PR1 = single-stage Qwen-Image t2i; kv_sender_info
+        # defaults None.)
+        if getattr(request, "kv_sender_info", None) is not None:
+            raise NotImplementedError(
+                "runtime_v2 (PR1) does not support upstream KV transfer / multi-stage "
+                "requests (kv_sender_info); use the legacy path"
+            )
+        # LoRA is OUT of PR1 scope: the runtime_v2 worker path calls the task
+        # executor directly and NEVER activates worker.lora_manager (which the
+        # legacy DiffusionWorker.execute_stepwise does before every forward), so
+        # a request carrying a lora_request would silently run with the BASE /
+        # previously-active adapter -- wrong output, no error. Reject at the same
+        # frontend entry as kv_sender_info so the caller can fall back to the
+        # legacy path instead of getting a silently-wrong image. (Activating the
+        # adapter in the runtime_v2 worker is deferred to a follow-up PR.)
+        if getattr(request.sampling_params, "lora_request", None) is not None:
+            raise NotImplementedError(
+                "runtime_v2 (PR1) does not support LoRA requests (lora_request); "
+                "use the legacy path"
+            )
+        request_id = request.request_id
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("DiffusionEngine is closed.")
+            fut = self.main_loop.create_future()
+            self._out_queue[request_id] = fut
+            self._runtime_v2_inflight.add(request_id)
+        # Send over ZMQ to the scheduler proc. Only the event-loop thread touches
+        # the client, so no lock is needed for the send itself.
+        try:
+            await self._rv2_client.add_request(request_id, request)
+        except BaseException:
+            # The send did not complete BEFORE the scheduler proc accepted the
+            # request: a failure (e.g. _send_request_nowait timed out because the
+            # proc is not draining, or EngineDeadError) OR the awaiting task was
+            # CANCELLED (client disconnect/timeout while the send is sleeping /
+            # retrying). asyncio.CancelledError is a BaseException on 3.11+, so a
+            # bare ``except Exception`` would miss it and leak the registration:
+            # the drain loop would poll forever for a terminal that can never
+            # arrive and the future would be retained. Catch BaseException, roll
+            # back, then re-raise (including CancelledError) so the caller sees it.
+            with self._cv:
+                self._out_queue.pop(request_id, None)
+                self._runtime_v2_inflight.discard(request_id)
+            if not fut.done():
+                fut.cancel()
+            raise
         return request_id
 
     async def get_result(self, request_id: str) -> DiffusionOutput:
@@ -676,14 +1089,30 @@ class DiffusionEngine:
     async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         # No lock needed: add_request is already protected by self._cv, and
         # all executor calls are serialized inside the busy loop.
-        request_id = self.add_request(request)
+        if getattr(self, "enable_runtime_v2", False):
+            # runtime_v2 sends over ZMQ to the scheduler proc (awaitable).
+            request_id = await self._add_request_runtime_v2(request)
+        else:
+            request_id = self.add_request(request)
         return await self.get_result(request_id)
 
     def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
+        # runtime_v2 rejects streaming_output in PR1 (guarded in
+        # _add_request_runtime_v2); the legacy sync add_request handles the rest.
         request_id = self.add_request(request)
         return self.get_streaming_result(request_id)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        if getattr(self, "enable_runtime_v2", False):
+            # This synchronous path drives the legacy scheduler/execute_fn and is
+            # only used by _dummy_run, which is skipped under the flag. runtime_v2
+            # now runs the scheduler in a SEPARATE process reachable only via the
+            # async client (no in-process blocking execute), so a stray sync call
+            # cannot be served -- fail loudly instead of dereferencing a removed
+            # in-process runner. Use async_add_req_and_wait_for_response instead.
+            raise NotImplementedError(
+                "runtime_v2 has no synchronous add path; use async_add_req_and_wait_for_response."
+            )
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -848,6 +1277,12 @@ class DiffusionEngine:
         """
         assert isinstance(method, str), "Only string method names are supported for now"
 
+        if getattr(self, "enable_runtime_v2", False):
+            # The legacy executor does not exist in runtime_v2 mode; the runner's
+            # collective_rpc is not wired in PR1. Fail loudly rather than
+            # dereferencing the None executor.
+            raise NotImplementedError("collective_rpc is not supported in runtime_v2 mode (PR1)")
+
         # If the busy loop hasn't started yet (e.g. during _dummy_run in
         # __init__, or before the first async request after construction),
         # there is no busy-loop thread to drain the RPC queue. Fall back to
@@ -888,6 +1323,16 @@ class DiffusionEngine:
         Mirrors :meth:`async_add_req_and_wait_for_response`: enqueue a task
         keyed by a future and ``await`` the result without blocking the loop.
         """
+        assert isinstance(method, str), "Only string method names are supported for now"
+
+        if getattr(self, "enable_runtime_v2", False):
+            # In runtime_v2 mode the legacy executor / _rpc_queue drain path does
+            # not run (there is no in-process busy loop; the scheduler runs in a
+            # separate process and only results are drained). Enqueuing here would
+            # hang the awaiting caller forever. Fail fast, mirroring the sync
+            # collective_rpc guard.
+            raise NotImplementedError("async_collective_rpc is not supported in runtime_v2 mode (PR1)")
+
         await self._check_and_start_background_loop()
         task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
         aio_fut = asyncio.wrap_future(task.future)
@@ -977,12 +1422,79 @@ class DiffusionEngine:
         else:
             self._loop_started = False
 
-        self.scheduler.close()
-        self.executor.shutdown()
+        if getattr(self, "enable_runtime_v2", False):
+            # runtime_v2 runs the scheduler + worker pool in a SEPARATE process:
+            # cancel the drain task, then shut down the client (sends shutdown +
+            # closes sockets) and the proc manager (stops the scheduler proc and
+            # its GPU workers), in place of the legacy scheduler.close()/
+            # executor.shutdown(). stop_event (set above) already tells the drain
+            # loop to exit.
+            drain_task = self._rv2_drain_task
+            if drain_task is not None and not drain_task.done():
+                loop = self.main_loop
+                if loop is not None and loop.is_running():
+                    loop.call_soon_threadsafe(drain_task.cancel)
+                else:
+                    drain_task.cancel()
+            self._rv2_drain_task = None
+            if self._rv2_client is not None:
+                try:
+                    self._rv2_client.close()
+                except Exception as e:
+                    logger.warning("Error shutting down runtime_v2 scheduler client: %s", e)
+            elif self._rv2_proc_manager is not None:
+                # Client owns the manager shutdown; only shut the manager down
+                # directly if there is no client to do it.
+                try:
+                    self._rv2_proc_manager.shutdown(timeout=10)
+                except Exception as e:
+                    logger.warning("Error shutting down runtime_v2 scheduler proc manager: %s", e)
+        else:
+            self.scheduler.close()
+            self.executor.shutdown()
         self._shutdown_complete = True
 
     def abort(self, request_id: str | Iterable[str]) -> None:
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
+
+        if getattr(self, "enable_runtime_v2", False):
+            # Forward the abort to the scheduler proc over ZMQ. The client's
+            # send is a synchronous ZMQ operation (plain Context), so we can send
+            # it directly here without an event loop. The scheduler proc drains
+            # its abort branch and releases the request. (In-flight cancellation
+            # semantics are best-effort in PR1.)
+            client = self._rv2_client
+            if client is not None:
+                client.abort_nowait(request_ids)
+            # The scheduler proc's abort branch sends NOTHING back for an aborted
+            # id, so the drain loop would otherwise keep polling it forever and
+            # its future/_out_queue entry + _runtime_v2_inflight membership would
+            # leak. Resolve each aborted request locally (mirroring the legacy
+            # DiffusionOutput(aborted=True, ...) convention that
+            # _finalize_finished_request returns). _resolve_runtime_v2_request
+            # pops the future + discards inflight under the lock and no-ops if
+            # the future is already gone, so a real terminal racing in cannot
+            # double-resolve.
+            for req_id in request_ids:
+                self._resolve_runtime_v2_request(
+                    req_id,
+                    DiffusionOutput(
+                        aborted=True,
+                        abort_message=f"Request {req_id} aborted.",
+                    ),
+                )
+                # The proc's abort branch sends nothing back, BUT a terminal it
+                # had ALREADY sent before receiving the abort may still be en
+                # route / buffered in the client with packed SHM handles. The
+                # future is resolved now and the id is out of _runtime_v2_inflight,
+                # so the drain loop would never fetch that late result -> its SHM
+                # segments would leak. Tombstone the id so the drain loop (the
+                # sole client reader -- we must not touch the client from this,
+                # possibly non-event-loop, thread) pulls + discards it. Guard with
+                # _cv, mirroring _runtime_v2_inflight.
+                with self._cv:
+                    self._runtime_v2_aborted[req_id] = time.monotonic() + _RUNTIME_V2_ABORT_TOMBSTONE_S
+            return
 
         with self._cv:
             if self._closed:
@@ -1039,3 +1551,55 @@ class DiffusionEngine:
             return runner_output.result
 
         return DiffusionOutput(error=missing_result_error)
+
+    def is_backend_dead(self) -> bool:
+        """True iff this engine's execution backend has permanently failed.
+
+        Single, path-agnostic death signal for the outer ``StageDiffusionProc``:
+
+        * runtime_v2: the scheduler + worker pool run in a SEPARATE process
+          (``RuntimeV2SchedulerProc``). ``self.executor`` is ``None`` here, so the
+          legacy executor probe never fires. Instead report dead when the
+          scheduler client has seen the death sentinel / proc-monitor
+          (``_rv2_client.engine_dead``) OR the scheduler proc itself is no longer
+          alive (``_rv2_proc_manager.proc``). Once either is true, every in-flight
+          request is failed by the drain loop and every future request will fail
+          the same way, so the whole diffusion proc must tear down.
+        * legacy: key off the multiproc executor's ``_closed`` / ``is_failed``
+          flags, which ``MultiprocDiffusionExecutor`` sets the moment any worker
+          process exits (mirrors the old ``_is_executor_dead`` check).
+        """
+        if getattr(self, "enable_runtime_v2", False):
+            client = self._rv2_client
+            if client is not None and getattr(client, "engine_dead", False):
+                return True
+            proc_manager = self._rv2_proc_manager
+            proc = getattr(proc_manager, "proc", None) if proc_manager is not None else None
+            if proc is not None:
+                try:
+                    if not proc.is_alive():
+                        return True
+                except Exception:
+                    # A proc handle that cannot report liveness is treated as
+                    # not-yet-dead here; the client's engine_dead signal above
+                    # remains the primary death detector.
+                    return False
+            return False
+
+        executor = getattr(self, "executor", None)
+        if executor is None:
+            return False
+        return bool(getattr(executor, "_closed", False) or getattr(executor, "is_failed", False))
+
+    def register_backend_dead_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired when the execution backend is detected dead.
+
+        Lets the owning ``StageDiffusionProc`` wake its IDLE run loop the instant
+        the backend dies, instead of only noticing when a request touches it. For
+        runtime_v2 this routes to the scheduler client's proc monitor (which fires
+        even while the stage is idle); for the legacy path it is a no-op (that
+        path already surfaces worker death through the executor failure callback
+        and the per-request ``is_backend_dead`` checks).
+        """
+        if getattr(self, "enable_runtime_v2", False) and self._rv2_client is not None:
+            self._rv2_client.set_on_engine_dead(callback)

@@ -67,7 +67,14 @@ class InlineStageDiffusionClient(StageClientBase):
         self._engine_dead = False
         self._shutting_down = False
 
-        self._engine.executor.register_failure_callback(self._mark_engine_dead)
+        # Under runtime_v2 the legacy executor is not built (engine.executor is
+        # None); the RuntimeV2Runner owns the worker pool. The runner does not
+        # expose a failure-callback registration in PR1, so worker-death is
+        # surfaced lazily via check_health() (which polls the runner's worker
+        # pool) rather than eagerly via a callback. Guard the registration so
+        # the inline client constructs under runtime_v2.
+        if self._engine.executor is not None:
+            self._engine.executor.register_failure_callback(self._mark_engine_dead)
 
         logger.info(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (batch_size=%d)",
@@ -268,7 +275,15 @@ class InlineStageDiffusionClient(StageClientBase):
         if self._shutting_down:
             raise EngineDeadError("InlineStageDiffusionClient is shutting down")
         try:
-            self._engine.executor.check_health()
+            if self._engine.executor is not None:
+                self._engine.executor.check_health()
+            elif getattr(self._engine, "enable_runtime_v2", False):
+                # runtime_v2 runs the worker pool in a separate scheduler proc;
+                # delegate health to the scheduler client (the in-process runner
+                # was removed). The client raises EngineDeadError if the proc died.
+                client = getattr(self._engine, "_rv2_client", None)
+                if client is not None:
+                    client.check_health()
         except EngineDeadError:
             self._mark_engine_dead()
             raise

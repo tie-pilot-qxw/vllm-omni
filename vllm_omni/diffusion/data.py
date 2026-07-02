@@ -764,6 +764,17 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # Runtime v2 settings
+    enable_runtime_v2: bool = False
+    runtime_v2_denoise_chunk_size: int = 1
+    runtime_v2_scheduler_policy: str = "fcfs"
+    # Startup timeout (seconds) for the nested runtime_v2 scheduler subprocess.
+    # Mirrors the orchestrator's --stage-init-timeout: forwarded via
+    # stage_engine_args so a slow-loading checkpoint gets the SAME startup window
+    # the outer stage does, instead of the hardcoded 300s default. Only read on
+    # the runtime_v2 path (DiffusionEngine.__init__ -> RuntimeV2SchedulerProcManager).
+    stage_init_timeout: int = 300
+
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
 
