@@ -12,6 +12,7 @@ from vllm_omni.diffusion.ipc import (
     DIFFUSION_RPC_RESULT_ENVELOPE,
     _pack_value_if_large,
     _unpack_if_shm_handle,
+    diffusion_output_has_shm_handles,
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
 )
@@ -130,6 +131,58 @@ def test_batch_runner_output_round_trips_nested_results_through_shm() -> None:
     torch.testing.assert_close(output["req-0"].result.output, first)
     torch.testing.assert_close(output["req-1"].result.output["image"], second)
     assert output["req-error"].result.error == "boom"
+
+
+@pytest.mark.parametrize(
+    "make_output",
+    [
+        # Nested-dict output: the large tensor is one level down, so a top-level
+        # ``output.output.get("__tensor_shm__")`` check would miss it.
+        pytest.param(
+            lambda t: DiffusionOutput(output={"image": t}),
+            id="nested-dict-output",
+        ),
+        # Tuple output (LTX2 / DreamID shape): handle nested in a tuple.
+        pytest.param(
+            lambda t: DiffusionOutput(output=(t,)),
+            id="tuple-output",
+        ),
+        # trajectory_timesteps / trajectory_log_probs were never checked before.
+        pytest.param(
+            lambda t: DiffusionOutput(output=None, trajectory_timesteps=t),
+            id="trajectory-timesteps",
+        ),
+        pytest.param(
+            lambda t: DiffusionOutput(output=None, trajectory_log_probs=t),
+            id="trajectory-log-probs",
+        ),
+    ],
+)
+def test_diffusion_output_has_shm_handles_detects_all_packed_shapes(make_output) -> None:
+    large = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    output = make_output(large)
+
+    pack_diffusion_output_shm(output)
+    try:
+        # Every shape ``_pack_diffusion_fields`` can pack must be detected as a
+        # real SHM transport so the caller unpacks + unlinks (no leak, no
+        # accidental fallback to pickling the full tensor through the queue).
+        assert diffusion_output_has_shm_handles(output) is True
+    finally:
+        unpack_diffusion_output_shm(output)
+
+
+def test_diffusion_output_has_shm_handles_false_when_everything_inline() -> None:
+    # All tensors are below the SHM threshold, so packing creates no handles and
+    # the detector must report False (the caller then pickles inline -- nothing
+    # to unlink).
+    output = DiffusionOutput(
+        output={"image": torch.zeros(2, 3)},
+        trajectory_timesteps=torch.ones(4),
+        trajectory_log_probs=torch.ones(3),
+    )
+    pack_diffusion_output_shm(output)
+    assert diffusion_output_has_shm_handles(output) is False
 
 
 def test_pack_value_keeps_tensor_at_threshold_inline() -> None:
